@@ -31,12 +31,12 @@
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/input.h>
+#include <linux/of_device.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
-
 #include <linux/ioport.h>
+#include <linux/version.h>
 #include <asm/io.h>
-
 
 MODULE_AUTHOR("Markus Hiienkari");
 MODULE_DESCRIPTION("NES, SNES, N64, PSX, GC gamepad driver");
@@ -44,11 +44,7 @@ MODULE_LICENSE("GPL");
 
 #define GC_MAX_DEVICES		6
 
-#ifdef CONFIG_ARCH_MULTI_V7
-#define BCM2708_PERI_BASE 0x3F000000
-#else
-#define BCM2708_PERI_BASE 0x20000000
-#endif
+#define BCM2708_PERI_BASE gc_bcm2708_peri_base
 
 #define GPIO_BASE                (BCM2708_PERI_BASE + 0x200000) /* GPIO controller */
 
@@ -57,60 +53,60 @@ MODULE_LICENSE("GPL");
 
 #define GPIO_STATUS (*(gpio+13))
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
+#define HAVE_TIMER_SETUP
+#endif
+
 static volatile unsigned *gpio;
 
-/*
- from http://git.drogon.net/?p=wiringPi;a=blob_plain;f=wiringPi/wiringPi.c
- * delayMicroseconds:
- *	This is somewhat intersting. It seems that on the Pi, a single call
- *	to nanosleep takes some 80 to 130 microseconds anyway, so while
- *	obeying the standards (may take longer), it's not always what we
- *	want!
+/* BCM board peripherals address base */
+static u32 gc_bcm2708_peri_base;
+
+/**
+ * gc_bcm_peri_base_probe - Find the peripherals address base for
+ * the running Raspberry Pi model. It needs a kernel with runtime Device-Tree
+ * overlay support.
  *
- *	So what I'll do now is if the delay is less than 100uS we'll do it
- *	in a hard loop, watching a built-in counter on the ARM chip. This is
- *	somewhat sub-optimal in that it uses 100% CPU, something not an issue
- *	in a microcontroller, but under a multi-tasking, multi-user OS, it's
- *	wastefull, however we've no real choice )-:
+ * Based on the userland 'bcm_host' library code from
+ * https://github.com/raspberrypi/userland/blob/2549c149d8aa7f18ff201a1c0429cb26f9e2535a/host_applications/linux/libs/bcm_host/bcm_host.c#L150
  *
- *      Plan B: It seems all might not be well with that plan, so changing it
- *      to use gettimeofday () and poll on that instead...
- *********************************************************************************
+ * Reference: https://www.raspberrypi.org/documentation/hardware/raspberrypi/peripheral_addresses.md
+ *
+ * If any error occurs reading the device tree nodes/properties, then return 0.
  */
+static u32 __init gc_bcm_peri_base_probe(void) {
 
-void timevaladd(struct timeval *result, const struct timeval *a, const struct timeval *b)
-{
-    result->tv_sec = a->tv_sec + b->tv_sec;
-    result->tv_usec = a->tv_usec + b->tv_usec;
-    if (result->tv_usec >= 1000000)
-    {
-        ++result->tv_sec;
-        result->tv_usec -= 1000000;
-    }
+	char *path = "/soc";
+	struct device_node *dt_node;
+	u32 base_address = 1;
+
+	dt_node = of_find_node_by_path(path);
+	if (!dt_node) {
+		pr_err("failed to find device-tree node: %s\n", path);
+		return 0;
+	}
+
+	if (of_property_read_u32_index(dt_node, "ranges", 1, &base_address)) {
+		pr_err("failed to read range index 1\n");
+		return 0;
+	}
+
+	if (base_address == 0) {
+		if (of_property_read_u32_index(dt_node, "ranges", 2, &base_address)) {
+			pr_err("failed to read range index 2\n");
+			return 0;
+		}
+	}
+
+	return base_address == 1 ? 0x02000000 : base_address;
 }
-
-bool timeval_lt(const struct timeval *a, const struct timeval *b)
-{
-    if(a->tv_sec == b->tv_sec)
-    {
-        return a->tv_usec < b->tv_usec;
-    }
-    return a->tv_sec < b->tv_sec;
-}
-
-
 
 void delayMicrosecondsHard (unsigned int howLong)
 {
-    struct timeval tNow, tLong, tEnd ;
-    
-    do_gettimeofday (&tNow) ;
-    tLong.tv_sec  = howLong / 1000000 ;
-    tLong.tv_usec = howLong % 1000000 ;
-    timevaladd (&tEnd, &tNow, &tLong) ;
-    
-    while (timeval_lt (&tNow, &tEnd))
-        do_gettimeofday (&tNow) ;
+    ktime_t start_time, end_time;
+    start_time = end_time = ktime_get();
+    while (ktime_us_delta(end_time, start_time) < howLong)
+         end_time = ktime_get();
 }
 
 struct gc_config {
@@ -184,13 +180,22 @@ enum pad_gpios {
 	PAD6_GPIO = 3
 };
 
+/* GPIO pins 10, 11 */
+enum common_gpios {
+	NES_CLOCK_GPIO = 10,
+	NES_LATCH_GPIO = 11,
+	PSX_COMMAND_GPIO = 14,
+	PSX_SELECT_GPIO = 15,
+	PSX_CLOCK_GPIO = 18
+};
+
 static const int gc_gpio_ids[] = { PAD1_GPIO, PAD2_GPIO, PAD3_GPIO, PAD4_GPIO, PAD5_GPIO, PAD6_GPIO };
-static const int gc_status_bit[] = { (1<<PAD1_GPIO),
-									(1<<PAD2_GPIO),
-									(1<<PAD3_GPIO),
-									(1<<PAD4_GPIO),
-									(1<<PAD5_GPIO),
-									(1<<PAD6_GPIO) };
+static const unsigned long gc_status_bit[] = { 	(1<<PAD1_GPIO),
+												(1<<PAD2_GPIO),
+												(1<<PAD3_GPIO),
+												(1<<PAD4_GPIO),
+												(1<<PAD5_GPIO),
+												(1<<PAD6_GPIO) };
 
 static const char *gc_names[] = {
 	NULL, "SNES pad", "NES pad", "Gamecube controller", "NES pad (Four Score)",
@@ -274,12 +279,12 @@ static inline void gc_n64_send_command(struct gc_nin_gpio *ningpio)
  * are read in parallel.
  */
 
-static void gc_n64_read_packet(struct gc *gc, struct gc_nin_gpio *ningpio, unsigned char *data)
+static void gc_n64_read_packet(struct gc *gc, struct gc_nin_gpio *ningpio, unsigned long *data)
 {
 	int i,j,k;
 	unsigned prev, mindiff=1000, maxdiff=0;
 	unsigned long flags;
-	static unsigned char samplebuf[6500]; // =max(GC_N64_BUFSIZE, GC_GCUBE_BUFSIZE)
+	static unsigned long samplebuf[6500]; // =max(GC_N64_BUFSIZE, GC_GCUBE_BUFSIZE)
 	
 	/* disable interrupts */
 	local_irq_save(flags);
@@ -337,9 +342,10 @@ static void gc_n64_read_packet(struct gc *gc, struct gc_nin_gpio *ningpio, unsig
 
 static void gc_n64_process_packet(struct gc *gc)
 {
-	unsigned char data[GC_N64_LENGTH];
+	unsigned long data[GC_N64_LENGTH];
 	struct input_dev *dev;
-	int i, j, s;
+	int i, j;
+	unsigned long s;
 	signed char x, y;
 
 	gc_n64_read_packet(gc, &n64_prop, data);
@@ -457,9 +463,10 @@ struct gc_nin_gpio gcube_prop = { GC_GCUBE,
 
 static void gc_gcube_process_packet(struct gc *gc)
 {
-	unsigned char data[GC_GCUBE_LENGTH];
+	unsigned long data[GC_GCUBE_LENGTH];
 	struct input_dev *dev;
-	int i, j, s;
+	int i, j;
+	unsigned long s;
 	unsigned char x, y, x2, y2, y3, y4;
 
 	gc_n64_read_packet(gc, &gcube_prop, data);
@@ -527,9 +534,8 @@ static void gc_gcube_process_packet(struct gc *gc)
 #define GC_NESFOURSCORE_LENGTH	24 /* The NES Four Score adapter uses 24
 					   bits of data */
 
-/* clock = gpio10, latch = gpio11 */
-#define GC_NES_CLOCK	0x400
-#define GC_NES_LATCH	0x800
+#define GC_NES_CLOCK	(1<<NES_CLOCK_GPIO)
+#define GC_NES_LATCH	(1<<NES_LATCH_GPIO)
 
 static const unsigned char gc_nes_bytes[] = { 0, 1, 2, 3 };
 static const unsigned char gc_snes_bytes[] = { 8, 0, 2, 3, 9, 1, 10, 11 };
@@ -543,7 +549,7 @@ static const short gc_snes_btn[] = {
  * this port are read in parallel.
  */
 
-static void gc_nes_read_packet(struct gc *gc, int length, unsigned char *data)
+static void gc_nes_read_packet(struct gc *gc, int length, unsigned long *data)
 {
 	int i;
 
@@ -562,10 +568,11 @@ static void gc_nes_read_packet(struct gc *gc, int length, unsigned char *data)
 
 static void gc_nes_process_packet(struct gc *gc)
 {
-	unsigned char data[GC_SNESMOUSE_LENGTH];
+	unsigned long data[GC_SNESMOUSE_LENGTH];
 	struct gc_pad *pad;
 	struct input_dev *dev, *dev2;
-	int i, j, s, len;
+	int i, j, len;
+	unsigned long s;
 	unsigned char fs_connected;
 	char x_rel, y_rel;
 
@@ -732,9 +739,9 @@ static void gc_nes_process_packet(struct gc *gc)
 #define GC_PSX_ANALOG	5		/* Analog in Analog mode / Rumble in Green mode */
 #define GC_PSX_RUMBLE	7		/* Rumble in Red mode */
 
-#define GC_PSX_CLOCK	(1<<18)		/* Pin 18 */
-#define GC_PSX_COMMAND	(1<<14)		/* Pin 14 */
-#define GC_PSX_SELECT	(1<<15)		/* Pin 15 */
+#define GC_PSX_CLOCK	(1<<PSX_CLOCK_GPIO)
+#define GC_PSX_COMMAND	(1<<PSX_COMMAND_GPIO)
+#define GC_PSX_SELECT	(1<<PSX_SELECT_GPIO)
 
 #define GC_PSX_ID(x)	((x) >> 4)	/* High nibble is device type */
 #define GC_PSX_LEN(x)	(((x) & 0xf) << 1)	/* Low nibble is length in bytes/2 */
@@ -755,7 +762,8 @@ static const short gc_psx_ddr_btn[] = { BTN_0, BTN_1, BTN_2, BTN_3 };
 
 static void gc_psx_command(struct gc *gc, int b, unsigned char *data)
 {
-	int i, j, read;
+	int i, j;
+	unsigned long read;
 
 	memset(data, 0, GC_MAX_DEVICES);
 
@@ -767,7 +775,7 @@ static void gc_psx_command(struct gc *gc, int b, unsigned char *data)
 			GPIO_SET = GC_PSX_COMMAND;
 		else
 			GPIO_CLR = GC_PSX_COMMAND;
-		
+
 		udelay(GC_PSX_DELAY);
 		GPIO_SET = GC_PSX_CLOCK;
 
@@ -940,9 +948,15 @@ static void gc_psx_process_packet(struct gc *gc)
  * gc_timer() initiates reads of console pads data.
  */
 
+#ifdef HAVE_TIMER_SETUP
+static void gc_timer(struct timer_list *t)
+{
+	struct gc *gc = from_timer(gc, t, timer);
+#else
 static void gc_timer(unsigned long private)
 {
 	struct gc *gc = (void *) private;
+#endif
 
 /*
  * N64 & Gamecube pads
@@ -1176,7 +1190,7 @@ static int __init gc_setup_pad(struct gc *gc, int idx, int pad_type)
 	}
 
 	/* set data pin to input */
-	*gpio &= ~(7<<(gc_gpio_ids[idx]*3));
+	*(gpio+(gc_gpio_ids[idx]/10)) &= ~(7<<((gc_gpio_ids[idx]%10)*3));
 	
 	/* enable pull-up on GPIO4 or higher */
 	if (gc_gpio_ids[idx] >= 4) {
@@ -1188,7 +1202,7 @@ static int __init gc_setup_pad(struct gc *gc, int idx, int pad_type)
 		*(gpio+38) = 0x00;
 	}
 		
-	printk("GPIO%d configured for %s data pin\n", gc_gpio_ids[idx], gc_names[pad_type]);
+	pr_info("GPIO%d configured for %s data pin\n", gc_gpio_ids[idx], gc_names[pad_type]);
 
 	return 0;
 
@@ -1216,7 +1230,11 @@ static struct gc __init *gc_probe(int *pads, int n_pads)
 	}
 
 	mutex_init(&gc->mutex);
+	#ifdef HAVE_TIMER_SETUP
+	timer_setup(&gc->timer, gc_timer, 0);
+	#else
 	setup_timer(&gc->timer, gc_timer, (long) gc);
+	#endif
 
 	for (i = 0; i < n_pads && i < GC_MAX_DEVICES; i++) {
 		if (!pads[i])
@@ -1234,23 +1252,29 @@ static struct gc __init *gc_probe(int *pads, int n_pads)
 		err = -EINVAL;
 		goto err_free_gc;
 	}
-	
+
 	/* setup common pins for each pad type */
 	if (gc->pad_count[GC_NES] ||
 		gc->pad_count[GC_SNES] ||
 		gc->pad_count[GC_SNESMOUSE] ||
 		gc->pad_count[GC_NESFOURSCORE]) {
-		
+
 		/* set clk & latch pins to OUTPUT */
-		*(gpio+1) &= ~0x3f;
-		*(gpio+1) |= 0x09;
+		*(gpio+(NES_CLOCK_GPIO/10)) &= ~(7<<((NES_CLOCK_GPIO%10)*3));
+		*(gpio+(NES_CLOCK_GPIO/10)) |= (1<<((NES_CLOCK_GPIO%10)*3));
+		*(gpio+(NES_LATCH_GPIO/10)) &= ~(7<<((NES_LATCH_GPIO%10)*3));
+		*(gpio+(NES_LATCH_GPIO/10)) |= (1<<((NES_LATCH_GPIO%10)*3));
 	}
 	if (gc->pad_count[GC_PSX] ||
 		gc->pad_count[GC_DDR]) {
-	
+
 		/* set clk, cmd & sel pins to OUTPUT */
-		*(gpio+1) &= ~((7<<12) | (7<<15) | (7<<24));
-		*(gpio+1) |= ((1<<12) | (1<<15) | (1<<24));
+		*(gpio+(PSX_CLOCK_GPIO/10)) &= ~(7<<((PSX_CLOCK_GPIO%10)*3));
+		*(gpio+(PSX_CLOCK_GPIO/10)) |= (1<<((PSX_CLOCK_GPIO%10)*3));
+		*(gpio+(PSX_COMMAND_GPIO/10)) &= ~(7<<((PSX_COMMAND_GPIO%10)*3));
+		*(gpio+(PSX_COMMAND_GPIO/10)) |= (1<<((PSX_COMMAND_GPIO%10)*3));
+		*(gpio+(PSX_SELECT_GPIO/10)) &= ~(7<<((PSX_SELECT_GPIO%10)*3));
+		*(gpio+(PSX_SELECT_GPIO/10)) |= (1<<((PSX_SELECT_GPIO%10)*3));
 	}
 
 	return gc;
@@ -1283,11 +1307,20 @@ static void gc_remove(struct gc *gc)
 
 static int __init gc_init(void)
 {
+	/* Get the BCM2708 peripheral address */
+	gc_bcm2708_peri_base = gc_bcm_peri_base_probe();
+	if (!gc_bcm2708_peri_base) {
+		pr_err("failed to find peripherals address base via device-tree\n");
+		return -ENODEV;
+	}
+
+	pr_info("peripherals address base at 0x%08x\n", gc_bcm2708_peri_base);
+
 	/* Set up gpio pointer for direct register access */
-   	if ((gpio = ioremap(GPIO_BASE, 0xB0)) == NULL) {
-   	   	pr_err("io remap failed\n");
-   	   	return -EBUSY;
-   	}   	
+	if ((gpio = ioremap(GPIO_BASE, 0xB0)) == NULL) {
+		pr_err("io remap failed\n");
+		return -EBUSY;
+	}
 
 	if (gc_cfg.nargs < 1) {
 		pr_err("at least one device must be specified\n");
